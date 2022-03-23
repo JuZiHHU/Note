@@ -1,4 +1,5 @@
 # RUNOOB Markdown Test
+[toc]
 ## Hello World！
 
 
