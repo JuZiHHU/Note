@@ -108,8 +108,12 @@ $git config --global user.email Jhon@example.com"
 
 >git config --global user.email 这里是你注册github的邮箱
 ```
-2. 提交到远程仓库的时候，提示：fatal ：remote origin already exists  
-   解决方案：删除远程仓库；输入命令：git remote rm origin
+2. 提交到远程仓库的时候，提示：*fatal ：remote origin already exists*  
+   解决方案：删除远程仓库；输入命令：*git remote rm origin*
+
+3. 昨天还可以git push代码到远程仓库，今天git push时报了这个错：
+   *fatal: unable to access 'https://github.com/.......': OpenSSL SSL_read: Connection was reset, errno 10054*
+
 ## 常用git命令
 [git操作](https://www.runoob.com/git/git-basic-operations.html)
 [参考博客：Git的使用--如何将本地项目上传到Github](https://www.cnblogs.com/du-hong/p/9921214.html)
