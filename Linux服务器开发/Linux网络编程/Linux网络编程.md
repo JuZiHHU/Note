@@ -161,10 +161,10 @@ TCP/IP协议族是一个四层协议系统，自底而上分别是数据链路�
 
 **常见协议**
 
-*1. 应用层常见的协议有：FTP协议（File Transfer Protocol 文件传输协议）、HTTP协议（Hyper TextTransfer Protocol 超文本传输协议）、NFS（Network File System 网络文件系统）
+1. 应用层常见的协议有：FTP协议（File Transfer Protocol 文件传输协议）、HTTP协议（Hyper TextTransfer Protocol 超文本传输协议）、NFS（Network File System 网络文件系统）
 2. 传输层常见协议有：TCP协议（Transmission Control Protocol 传输控制协议）、UDP协议（UserDatagram Protocol 用户数据报协议）
 3. 网络层常见协议有：IP 协议（Internet Protocol 因特网互联协议）、ICMP 协议（Internet ControlMessage Protocol 因特网控制报文协议）、IGMP 协议（Internet Group Management Protocol 因特网组管理协议）
-4. 网络接口层常见协议有：ARP协议（Address Resolution Protocol 地址解析协议）、RARP协议（Reverse Address Resolution Protocol 反向地址解析协议)*
+4. 网络接口层常见协议有：ARP协议（Address Resolution Protocol 地址解析协议）、RARP协议（Reverse Address Resolution Protocol 反向地址解析协议)
    
 **UDP协议** 
 
@@ -173,7 +173,7 @@ TCP/IP协议族是一个四层协议系统，自底而上分别是数据链路�
 **TCP协议**  
 
 ![TCP协议](images/TCP协议.png)
-*1. 源端口号：发送方端口号
+1. 源端口号：发送方端口号
 2. 目的端口号：接收方端口号
 3. 序列号：本报文段的数据的第一个字节的序号
 4. 确认序号：期望收到对方下一个报文段的第一个数据字节的序号
@@ -187,12 +187,12 @@ TCP/IP协议族是一个四层协议系统，自底而上分别是数据链路�
 13. 窗口：指发送本报文段的一方的接收窗口（而不是自己的发送窗口）
 14. 校验和：校验和字段检验的范围包括首部和数据两部分，在计算校验和时需要加上 12 字节的伪头部
 15. 紧急指针：仅在 URG = 1 时才有意义，它指出本报文段中的紧急数据的字节数（紧急数据结束后就是普通数据），即指出了紧急数据的末尾在报文中的位置，注意：即使窗口为零时也可发送紧急数据
-16. 选项：长度可变，最长可达 40 字节，当没有使用选项时，TCP 首部长度是 20 字节*
+16. 选项：长度可变，最长可达 40 字节，当没有使用选项时，TCP 首部长度是 20 字节
     
 **IP协议**
 ![IP协议](images/IP协议.png)
 
-*1. 版本：IP 协议的版本。通信双方使用过的 IP 协议的版本必须一致，目前最广泛使用的 IP 协议版本号为 4（即IPv4)
+1. 版本：IP 协议的版本。通信双方使用过的 IP 协议的版本必须一致，目前最广泛使用的 IP 协议版本号为 4（即IPv4)
 2. 首部长度：单位是 32 位（4 字节）
 3. 服务类型：一般不适用，取值为 0
 4. 总长度：指首部加上数据的总长度，单位为字节
@@ -203,7 +203,7 @@ TCP/IP协议族是一个四层协议系统，自底而上分别是数据链路�
 9. 协议：指出此数据报携带的数据时使用何种协议，以便使目的主机的 IP 层知道应将数据部分上交给哪个处理过程，常用的 ICMP(1)，IGMP(2)，TCP(6)，UDP(17)，IPv6（41）
 10. 首部校验和：只校验数据报的首部，不包括数据部分。
 11. 源地址：发送方 IP 地址
-12. 目的地址：接收方 IP 地址*
+12. 目的地址：接收方 IP 地址
 
 **以太网帧协议**
 
