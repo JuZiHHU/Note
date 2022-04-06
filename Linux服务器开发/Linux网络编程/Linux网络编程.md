@@ -30,6 +30,10 @@
       - [TCP 三次握手](#tcp-三次握手)
       - [TCP 滑动窗口](#tcp-滑动窗口)
       - [四次挥手](#四次挥手)
+      - [多进程实现并发服务器](#多进程实现并发服务器)
+      - [多线程实现并发服务器](#多线程实现并发服务器)
+      - [TCP状态转换](#tcp状态转换)
+      - [端口复用](#端口复用)
 
 ## 4.1 网络结构模式
 
@@ -956,4 +960,468 @@ TCP服务器通知高层的应用进程，客户端向服务器的方向就释�
 可以看到，服务器结束TCP连接的时间要比客户端早一些
 
 ```
+#### 多进程实现并发服务器
 
+**server_process.c**
+
+```c++
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <wait.h>
+#include <errno.h>
+
+void recyleChild(int arg) {
+    // 在同一时间内需要回收的进程不止一个
+    while(1) {
+        int ret = waitpid(-1, NULL, WNOHANG);
+        if(ret == -1) {
+            // 所有的子进程都回收了
+            break;
+        }else if(ret == 0) {
+            // 还有子进程活着
+            break;
+        } else if(ret > 0){
+            // 被回收了
+            printf("子进程 %d 被回收了\n", ret);
+        }
+    }
+}
+
+int main() {
+   /*
+    #include <signal.h>
+    int sigaction(int signum, const struct sigaction *act,
+                            struct sigaction *oldact);
+
+        - 功能：检查或者改变信号的处理。信号捕捉
+        - 参数：
+            - signum : 需要捕捉的信号的编号或者宏值（信号的名称）
+            - act ：捕捉到信号之后的处理动作
+            - oldact : 上一次对信号捕捉相关的设置，一般不使用，传递NULL
+        - 返回值：
+            成功 0
+            失败 -1
+
+     struct sigaction {
+        // 函数指针，指向的函数就是信号捕捉到之后的处理函数
+        void     (*sa_handler)(int);
+        // 不常用
+        void     (*sa_sigaction)(int, siginfo_t *, void *);
+        // 临时阻塞信号集，在信号捕捉函数执行过程中，临时阻塞某些信号。
+        sigset_t   sa_mask;
+        // 使用哪一个信号处理对捕捉到的信号进行处理
+        // 这个值可以是0，表示使用sa_handler,也可以是SA_SIGINFO表示使用sa_sigaction
+        int        sa_flags;
+        // 被废弃掉了
+        void     (*sa_restorer)(void);
+    };
+
+    */
+    struct sigaction act;
+    act.sa_flags = 0;
+    sigemptyset(&act.sa_mask);
+    act.sa_handler = recyleChild;
+    // 注册信号捕捉
+    sigaction(SIGCHLD, &act, NULL);
+    
+    /*
+        int socket(int domain, int type, int protocol);
+        - 功能：创建一个套接字
+        - 参数：
+        - domain: 协议族
+        AF_INET : ipv4
+        AF_INET6 : ipv6
+        AF_UNIX, AF_LOCAL : 本地套接字通信（进程间通信）
+        - type: 通信过程中使用的协议类型
+        SOCK_STREAM : 流式协议
+        SOCK_DGRAM : 报式协议
+        - protocol : 具体的一个协议。一般写0
+        - SOCK_STREAM : 流式协议默认使用 TCP
+        - SOCK_DGRAM : 报式协议默认使用 UDP
+        - 返回值：
+        - 成功：返回文件描述符，操作的就是内核缓冲区。
+        - 失败：-1
+    */
+    // 创建socket
+    int lfd = socket(PF_INET, SOCK_STREAM, 0);
+    if(lfd == -1){
+        perror("socket");
+        exit(-1);
+    }
+    /*
+        struct sockaddr_in
+        {
+            sa_family_t sin_family; // __SOCKADDR_COMMON(sin_) 
+            in_port_t sin_port; // Port number. 
+            struct in_addr sin_addr; // Internet address. 
+            // Pad to size of `struct sockaddr'. 
+    
+            unsigned char sin_zero[sizeof (struct sockaddr) - __SOCKADDR_COMMON_SIZE -
+            sizeof (in_port_t) - sizeof (struct in_addr)];
+        };
+        struct in_addr
+        {
+            in_addr_t s_addr;
+        };
+    */
+    struct sockaddr_in saddr;
+    saddr.sin_family = AF_INET;
+    saddr.sin_port = htons(9999);
+    saddr.sin_addr.s_addr = INADDR_ANY;
+
+    // 绑定
+    int ret = bind(lfd,(struct sockaddr *)&saddr, sizeof(saddr));
+    if(ret == -1) {
+        perror("bind");
+        exit(-1);
+    }
+
+    // 监听
+
+    /*
+        int listen(int sockfd, int backlog); // /proc/sys/net/core/somaxconn
+        - 功能：监听这个socket上的连接
+        - 参数：
+            - sockfd : 通过socket()函数得到的文件描述符
+            - backlog : 未连接的和已经连接的和的最大值， 5
+    */
+    ret = listen(lfd, 128);
+    if(ret == -1) {
+        perror("listen");
+        exit(-1);
+    }
+
+    // 不断循环等待客户端连接
+    while(1) {
+
+        struct sockaddr_in cliaddr;
+        int len = sizeof(cliaddr);
+        // 接受连接
+        int cfd = accept(lfd, (struct sockaddr*)&cliaddr, &len);
+        if(cfd == -1) {
+            // EINTR:  The system call was interrupted 
+            // by a signal that was caught 
+            // before a valid connection arrived; see signal(7).
+            if(errno == EINTR) {
+                 // 某个子进程结束 连接中断 继续去等待下一个连接
+                continue;
+            }
+            perror("accept");
+            // 父进程结束
+            exit(-1);
+        }
+
+        // 每一个连接进来，创建一个子进程跟客户端通信
+        pid_t pid = fork();
+        if(pid == 0) {
+            // 子进程
+            // 获取客户端的信息
+            char cliIp[16];
+            inet_ntop(AF_INET, &cliaddr.sin_addr.s_addr, cliIp, sizeof(cliIp));
+            unsigned short cliPort = ntohs(cliaddr.sin_port);
+            printf("client ip is : %s, prot is %d\n", cliIp, cliPort);
+
+            // 接收客户端发来的数据
+            char recvBuf[1024];
+            while(1) {
+                int len = read(cfd, &recvBuf, sizeof(recvBuf));
+
+                if(len == -1) {
+                    perror("read");
+                    exit(-1);
+                }else if(len > 0) {
+                    printf("recv client : %s\n", recvBuf);
+                } else if(len == 0) {
+                    printf("client closed....\n");
+                    break;
+                }
+                write(cfd, recvBuf, strlen(recvBuf) + 1);
+            }
+            close(cfd);
+            exit(0);    // 退出当前子进程
+        }
+
+    }
+    close(lfd);
+    return 0;
+}
+ ```
+ **client.c**
+
+ ```c++
+ // TCP通信的客户端
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+
+int main() {
+
+    // 1.创建套接字
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if(fd == -1) {
+        perror("socket");
+        exit(-1);
+    }
+
+    // 2.连接服务器端
+    // 需要更改为本机ip
+    struct sockaddr_in serveraddr;
+    serveraddr.sin_family = AF_INET;
+    const char* ip="192.168.0.171";
+    inet_pton(AF_INET, ip, &serveraddr.sin_addr.s_addr);
+    serveraddr.sin_port = htons(9999);
+    int ret = connect(fd, (struct sockaddr *)&serveraddr, sizeof(serveraddr));
+
+    if(ret == -1) {
+        perror("connect");
+        exit(-1);
+    }
+    
+    // 3. 通信
+    char recvBuf[1024];
+    int i = 0;
+    while(1) {
+        
+        sprintf(recvBuf, "data : %d\n", i++);
+        
+        // 给服务器端发送数据
+        // 数据写入写缓存区
+        // 考虑字符串结束符 strlen(recvBuf)+1
+        write(fd, recvBuf, strlen(recvBuf)+1);
+
+        // 从读缓存区读取数据
+        int len = read(fd, recvBuf, sizeof(recvBuf));
+        if(len == -1) {
+            perror("read");
+            exit(-1);
+        } else if(len > 0) {
+            printf("recv server : %s\n", recvBuf);
+        } else if(len == 0) {
+            // 表示服务器端断开连接
+            printf("server closed...");
+            break;
+        }
+
+        sleep(1);
+    }
+
+    // 关闭连接
+    close(fd);
+
+    return 0;
+}
+```
+#### 多线程实现并发服务器
+
+**server_thread.c**
+
+```c++
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+
+struct sockInfo {
+    int fd; // 通信的文件描述符
+    struct sockaddr_in addr;
+    pthread_t tid;  // 线程号
+};
+
+// 相当于设置最大能同时连接客户端
+struct sockInfo sockinfos[128];
+
+void * working(void * arg) {
+    // 子线程和客户端通信   cfd 客户端的信息 线程号
+    // 获取客户端的信息
+    struct sockInfo * pinfo = (struct sockInfo *)arg;
+
+    char cliIp[16];
+    inet_ntop(AF_INET, &pinfo->addr.sin_addr.s_addr, cliIp, sizeof(cliIp));
+    unsigned short cliPort = ntohs(pinfo->addr.sin_port);
+    printf("client ip is : %s, prot is %d\n", cliIp, cliPort);
+
+    // 接收客户端发来的数据
+    char recvBuf[1024];
+    while(1) {
+        int len = read(pinfo->fd, &recvBuf, sizeof(recvBuf));
+
+        if(len == -1) {
+            perror("read");
+            exit(-1);
+        }else if(len > 0) {
+            printf("recv client : %s\n", recvBuf);
+        } else if(len == 0) {
+            printf("client closed....\n");
+            break;
+        }
+        write(pinfo->fd, recvBuf, strlen(recvBuf) + 1);
+    }
+    close(pinfo->fd);
+    return NULL;
+}
+
+int main() {
+
+    // 创建socket
+    int lfd = socket(PF_INET, SOCK_STREAM, 0);
+    if(lfd == -1){
+        perror("socket");
+        exit(-1);
+    }
+
+    struct sockaddr_in saddr;
+    saddr.sin_family = AF_INET;
+    saddr.sin_port = htons(9999);
+    saddr.sin_addr.s_addr = INADDR_ANY;
+
+    // 绑定
+    int ret = bind(lfd,(struct sockaddr *)&saddr, sizeof(saddr));
+    if(ret == -1) {
+        perror("bind");
+        exit(-1);
+    }
+
+    // 监听
+    ret = listen(lfd, 128);
+    if(ret == -1) {
+        perror("listen");
+        exit(-1);
+    }
+
+    // 初始化数据
+    int max = sizeof(sockinfos) / sizeof(sockinfos[0]);
+    for(int i = 0; i < max; i++) {
+        bzero(&sockinfos[i], sizeof(sockinfos[i]));
+        sockinfos[i].fd = -1;
+        sockinfos[i].tid = -1;
+    }
+
+    // 循环等待客户端连接，一旦一个客户端连接进来，就创建一个子线程进行通信
+    while(1) {
+
+        struct sockaddr_in cliaddr;
+        int len = sizeof(cliaddr);
+        // 接受连接
+        int cfd = accept(lfd, (struct sockaddr*)&cliaddr, &len);
+
+        struct sockInfo * pinfo;
+        for(int i = 0; i < max; i++) {
+            // 从这个数组中找到一个可以用的sockInfo元素
+            if(sockinfos[i].fd == -1) {
+                pinfo = &sockinfos[i];
+                break;
+            }
+            if(i == max - 1) {
+                // 防止没有可用sockInfo元素时跳出循环
+                sleep(1);
+                i--;
+            }
+        }
+
+        pinfo->fd = cfd;
+        memcpy(&pinfo->addr, &cliaddr, len);
+
+        // 创建子线程
+        pthread_create(&pinfo->tid, NULL, working, pinfo);
+
+        pthread_detach(pinfo->tid);
+    }
+
+    close(lfd);
+    return 0;
+}
+ ```
+#### TCP状态转换
+
+![TCP状态转换](images/TCP状态转换.png)
+
+![TCP状态转换2](images/TCP状态转换2.png)
+
+- 2MSL（Maximum Segment Lifetime）
+  > 主动断开连接的一方, 最后进入一个 TIME_WAIT状态, 这个状态会持续: 2msl
+  > msl: 官方建议: 2分钟, 实际是30s
+  > 
+  > 当 TCP 连接主动关闭方接收到被动关闭方发送的 FIN 和最终的 ACK 后
+  > 连接的主动关闭方必须处TIME_WAIT 状态并持续 2MSL 时间。
+  >
+  > 这样就能够让 TCP 连接的主动关闭方在它发送的 ACK 丢失的情况下重新发送最终的 ACK。
+  > 主动关闭方重新发送的最终 ACK 并不是因为被动关闭方重传了 ACK
+  > 而是因为被动关闭方重传了它的 FIN。事实上，被动关闭方总是重传 FIN 直到它收到一个最终的 ACK。
+  > 
+
+
+- 半关闭
+    > 当 TCP 链接中 A 向 B 发送 FIN 请求关闭，另一端 B 回应 ACK 之后（A 端进入 FIN_WAIT_2状态），并没有立即发送 FIN 给 A，A 方处于半连接状态（半开关），此时 A 可以接收 B 发送的数据，但是 A 已经不能再向 B 发送数据。
+
+ ```c++
+#include <sys/socket.h>
+int shutdown(int sockfd, int how)
+sockfd: 需要关闭的socket的描述符
+    how: 允许为shutdown操作选择以下几种方式:
+        SHUT_RD(0)： 关闭sockfd上的读功能，此选项将不允许sockfd进行读操作。
+        该套接字不再接收数据，任何当前在套接字接受缓冲区的数据将被无声的丢弃掉。
+        SHUT_WR(1): 关闭sockfd的写功能，此选项将不允许sockfd进行写操作。进程不能在对此套接字发
+        出写操作。
+        SHUT_RDWR(2):关闭sockfd的读写功能。相当于调用shutdown两次：首先是以SHUT_RD,然后以
+        SHUT_WR。    
+```
+
+- 使用 close 中止一个连接，但它只是减少描述符的引用计数，并不直接关闭连接，只有当描述符的引用计数为 0 时才关闭连接
+
+- shutdown 不考虑描述符的引用计数，直接关闭描述符。也可选择中止一个方向的连接，只中止读或只中止写
+  
+-  如果有多个进程共享一个套接字，close 每被调用一次，计减 1 ，直到计数为 0 时，也就是所用进程都调用了 close，套接字将被释放
+-  在多进程中如果一个进程调用了 shutdown(sfd, SHUT_RDWR后，其它的进程将无法进行通信。但如果一个进程 close(sfd) 将不会影响到其它进
+
+
+#### 端口复用
+
+端口复用最常用的用途是:
+  - 防止服务器重启时之前绑定的端口还未释放
+  - 程序突然退出而系统没有释放端口
+
+```c++
+#include <sys/types.h>
+#include <sys/socket.h>
+// 设置套接字的属性（不仅仅能设置端口复用）
+int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen);
+ 参数：
+     - sockfd : 要操作的文件描述符
+     - level : 级别 - SOL_SOCKET (端口复用的级别)
+     - optname : 选项的名称
+       - SO_REUSEADDR
+       - SO_REUSEPORT
+     - optval : 端口复用的值（整形）
+       - 1 : 可以复用
+       - 0 : 不可以复用
+     - optlen : optval参数的大小
+端口复用，设置的时机是在服务器绑定端口之前。
+setsockopt();
+bind();
+```
+**查看网络相关信息**
+
+netsat
+参数:   
+
+    -a 所有的socket
+    -p 显示正在使用socket的程序的名称
+    -n 直接使用IP地址，而不通过域名服务器
+
+**案例见code lesson34**
+```c++
+panan@ecs-kc1-large-2-linux-20220314145535:~/Linux/lesson34$ netstat -anp | grep 9999
+(Not all processes could be identified, non-owned process info
+ will not be shown, you would have to be root to see it all.)
+tcp        0      0 0.0.0.0:9999            0.0.0.0:*               LISTEN      10343/./server      
+tcp        0      0 127.0.0.1:38082         127.0.0.1:9999          ESTABLISHED 10381/./client      
+tcp        0      0 127.0.0.1:9999          127.0.0.1:38082         ESTABLISHED 10343/./server      
+ ```
