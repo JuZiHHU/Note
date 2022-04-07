@@ -34,6 +34,12 @@
       - [多线程实现并发服务器](#多线程实现并发服务器)
       - [TCP状态转换](#tcp状态转换)
       - [端口复用](#端口复用)
+  - [IO多路复用](#io多路复用)
+      - [BIO模型与NIO模型](#bio模型与nio模型)
+      - [IO多路转接技术 select/poll](#io多路转接技术-selectpoll)
+        - [select](#select)
+        - [poll](#poll)
+        - [epoll](#epoll)
 
 ## 4.1 网络结构模式
 
@@ -1425,3 +1431,335 @@ tcp        0      0 0.0.0.0:9999            0.0.0.0:*               LISTEN      
 tcp        0      0 127.0.0.1:38082         127.0.0.1:9999          ESTABLISHED 10381/./client      
 tcp        0      0 127.0.0.1:9999          127.0.0.1:38082         ESTABLISHED 10343/./server      
  ```
+
+ ## IO多路复用
+
+> **I/O 多路复用使得程序能同时监听多个文件描述符，能够提高程序的性能**
+> 
+> **Linux 下实现 I/O 多路复用的系统调用主要有 select、poll 和 epoll**
+
+#### BIO模型与NIO模型
+
+![阻塞等待](images/阻塞等待.png)
+![BIO模型](images/BIO模型.png)
+![非阻塞忙轮询](images/非阻塞忙轮询.png)
+![NIO模型](images/NIO模型.png)
+
+#### IO多路转接技术 select/poll
+
+![IO多路转接技术多路转接技术1](images/IO多路转接技术多路转接技术1.png)
+
+##### select
+
+> 主旨思想：
+> 1. 首先要构造一个关于文件描述符的列表，将要监听的文件描述符添加到该列表中。
+> 2. 调用一个系统函数，监听该列表中的文件描述符，直到这些描述符中的一个或者多个进行I/O操作时，该函数才返回。
+    a.这个函数是阻塞
+    b.函数对文件描述符的检测的操作是由内核完成的
+> 3. 在返回时，它会告诉进程有多少（哪些）描述符要进行I/O操作。
+
+ ```c++
+// sizeof(fd_set) = 128 1024
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sys/select.h>
+int select(int nfds, fd_set *readfds, fd_set *writefds,fd_set *exceptfds, struct timeval *timeout);
+- 参数：
+    - nfds : 委托内核检测的最大文件描述符的值 + 1
+    - readfds : 要检测的文件描述符的读的集合，委托内核检测哪些文件描述符的读的属性
+        - 一般检测读操作
+        - 对应的是对方发送过来的数据，因为读是被动的接收数据，检测的就是读缓冲区
+        - 是一个传入传出参数
+    - writefds : 要检测的文件描述符的写的集合，委托内核检测哪些文件描述符的写的属性
+        - 委托内核检测写缓冲区是不是还可以写数据（不满的就可以写）
+    - exceptfds : 检测发生异常的文件描述符的集合
+    - timeout : 设置的超时时间
+        struct timeval {
+        long tv_sec; /* seconds */
+        long tv_usec; /* microseconds */
+        };
+        - NULL : 永久阻塞，直到检测到了文件描述符有变化
+        - tv_sec = 0 tv_usec = 0， 不阻塞
+        - tv_sec > 0 tv_usec > 0， 阻塞对应的时间
+    - 返回值 :
+        - -1 : 失败
+        - >0(n) : 检测的集合中有n个文件描述符发生了变化
+// 将参数文件描述符fd对应的标志位设置为0
+void FD_CLR(int fd, fd_set *set);
+// 判断fd对应的标志位是0还是1， 返回值 ： fd对应的标志位的值，0，返回0， 1，返回1
+int FD_ISSET(int fd, fd_set *set);
+// 将参数文件描述符fd 对应的标志位，设置为1
+void FD_SET(int fd, fd_set *set);
+// fd_set一共有1024 bit, 全部初始化为0
+void FD_ZERO(fd_set *set);
+```
+![select工作过程](images/select工作过程.png)
+![select多路复用](images/select多路复用.png)
+![select的缺点](images/select的缺点.png)
+
+**select.c**
+```c++
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/select.h>
+
+int main() {
+
+    // 创建socket
+    int lfd = socket(PF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in saddr;
+    saddr.sin_port = htons(9999);
+    saddr.sin_family = AF_INET;
+    saddr.sin_addr.s_addr = INADDR_ANY;
+
+    // 绑定
+    bind(lfd, (struct sockaddr *)&saddr, sizeof(saddr));
+
+    // 监听
+    listen(lfd, 8);
+
+    // 创建一个fd_set的集合，存放的是需要检测的文件描述符
+    fd_set rdset, tmp;
+    FD_ZERO(&rdset);
+    FD_SET(lfd, &rdset);
+    int maxfd = lfd;
+
+    while(1) {
+
+        tmp = rdset;
+
+        // 调用select系统函数，让内核帮检测哪些文件描述符有数据
+        int ret = select(maxfd + 1, &tmp, NULL, NULL, NULL);
+        if(ret == -1) {
+            perror("select");
+            exit(-1);
+        } else if(ret == 0) {
+            continue;
+        } else if(ret > 0) {
+            // 说明检测到了有文件描述符的对应的缓冲区的数据发生了改变
+            if(FD_ISSET(lfd, &tmp)) {
+                // 监听的文件描述符lfd为1 表示有新的客户端连接进来了
+                struct sockaddr_in cliaddr;
+                int len = sizeof(cliaddr);
+                // 返回一个通信的文件描述符
+                int cfd = accept(lfd, (struct sockaddr *)&cliaddr, &len);
+
+                
+                // 将新的文件描述符加入到集合中 
+                FD_SET(cfd, &rdset);
+
+                // 更新最大的文件描述符
+                maxfd = maxfd > cfd ? maxfd : cfd;
+            }
+
+            for(int i = lfd + 1; i <= maxfd; i++) {
+                if(FD_ISSET(i, &tmp)) {
+                    // 说明这个文件描述符对应的客户端发来了数据
+                    char buf[1024] = {0};
+                    int len = read(i, buf, sizeof(buf));
+                    if(len == -1) {
+                        perror("read");
+                        exit(-1);
+                    } else if(len == 0) {
+                        printf("client %d closed...\n",i);
+                        close(i);
+                        // 客户端关闭，对应文件描述符置0
+                        FD_CLR(i, &rdset);
+                    } else if(len > 0) {
+                        printf("from %d:read buf = %s \n", i,buf);
+                        write(i, buf, strlen(buf) + 1);
+                    }
+                }
+            }
+
+        }
+
+    }
+    close(lfd);
+    return 0;
+}
+
+ ```
+
+ **client.c**
+
+ ```c++
+ #include <stdio.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+
+int main() {
+
+    // 创建socket
+    int fd = socket(PF_INET, SOCK_STREAM, 0);
+    if(fd == -1) {
+        perror("socket");
+        return -1;
+    }
+
+    struct sockaddr_in seraddr;
+    inet_pton(AF_INET, "127.0.0.1", &seraddr.sin_addr.s_addr);
+    seraddr.sin_family = AF_INET;
+    seraddr.sin_port = htons(9999);
+
+    // 连接服务器
+    int ret = connect(fd, (struct sockaddr *)&seraddr, sizeof(seraddr));
+
+    if(ret == -1){
+        perror("connect");
+        return -1;
+    }
+
+    int num = 0;
+    while(1) {
+        char sendBuf[1024] = {0};
+        sprintf(sendBuf, "send data %d", num++);
+        write(fd, sendBuf, strlen(sendBuf) + 1);
+
+        // 接收
+        int len = read(fd, sendBuf, sizeof(sendBuf));
+        if(len == -1) {
+            perror("read");
+            return -1;
+        }else if(len > 0) {
+            printf("read buf = %s\n", sendBuf);
+        } else {
+            printf("服务器已经断开连接...\n");
+            break;
+        }
+        
+        sleep(1);
+        // usleep(1000);
+    }
+
+    close(fd);
+
+    return 0;
+}
+ ```
+
+
+
+ ##### poll
+
+ ```c++
+#include <poll.h>
+struct pollfd {
+    int fd; /* 委托内核检测的文件描述符 */
+    short events; /* 委托内核检测文件描述符的什么事件 */
+    short revents; /* 文件描述符实际发生的事件 */
+};
+struct pollfd myfd;
+myfd.fd = 5;
+myfd.events = POLLIN | POLLOUT;
+int poll(struct pollfd *fds, nfds_t nfds, int timeout);
+    - 参数：
+    - fds : 是一个struct pollfd 结构体数组，这是一个需要检测的文件描述符的集合
+    - nfds : 这个是第一个参数数组中最后一个有效元素的下标 + 1
+    - timeout : 阻塞时长
+        0 : 不阻塞
+        -1 : 阻塞，当检测到需要检测的文件描述符有变化，解除阻塞
+        >0 : 阻塞的时长
+    - 返回值：
+    -1 : 失败
+    >0（n） : 成功,n表示检测到集合中有n个文件描述符发生变化
+ ```
+
+![poll多路复用](images/poll多路复用.png)
+
+ ```c++
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <poll.h>
+int main() {
+    // 创建socket
+    int lfd = socket(PF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in saddr;
+    saddr.sin_port = htons(9999);
+    saddr.sin_family = AF_INET;
+    saddr.sin_addr.s_addr = INADDR_ANY;
+    // 绑定
+    bind(lfd, (struct sockaddr *)&saddr, sizeof(saddr));
+
+    // 监听
+    listen(lfd, 8);
+
+    // 初始化检测的文件描述符数组
+    struct pollfd fds[1024];
+    for(int i = 0; i < 1024; i++) {
+        fds[i].fd = -1;
+        fds[i].events = POLLIN;
+    }
+    // 加入监听文件描述符
+    fds[0].fd = lfd;
+    // nfds : 这个是第一个参数数组中最后一个有效元素的下标 + 1
+    int nfds = 0;
+
+    while(1) {
+
+        // 调用poll系统函数，让内核帮检测哪些文件描述符有数据
+        int ret = poll(fds, nfds + 1, -1);
+        if(ret == -1) {
+            perror("poll");
+            exit(-1);
+        } else if(ret == 0) {
+            continue;
+        } else if(ret > 0) {
+            
+            // 说明检测到了有文件描述符的对应的缓冲区的数据发生了改变
+            if(fds[0].revents & POLLIN) {
+                // 表示有新的客户端连接进来了
+                struct sockaddr_in cliaddr;
+                int len = sizeof(cliaddr);
+                int cfd = accept(lfd, (struct sockaddr *)&cliaddr, &len);
+
+                // 将新的文件描述符加入到集合中
+                for(int i = 1; i < 1024; i++) {
+                    if(fds[i].fd == -1) {
+                        fds[i].fd = cfd;
+                        fds[i].events = POLLIN;
+                        break;
+                    }
+                }
+
+                // 更新最大的文件描述符的索引
+                nfds = nfds > cfd ? nfds : cfd;
+            }
+
+            for(int i = 1; i <= nfds; i++) {
+                if(fds[i].revents & POLLIN) {
+                    // 说明这个文件描述符对应的客户端发来了数据
+                    char buf[1024] = {0};
+                    int len = read(fds[i].fd, buf, sizeof(buf));
+                    if(len == -1) {
+                        perror("read");
+                        exit(-1);
+                    } else if(len == 0) {
+                        printf("client closed...\n");
+                        close(fds[i].fd);
+                        fds[i].fd = -1;
+                    } else if(len > 0) {
+                        printf("read buf = %s\n", buf);
+                        write(fds[i].fd, buf, strlen(buf) + 1);
+                    }
+                }
+            }
+
+        }
+
+    }
+    close(lfd);
+    return 0;
+}
+```
+
+##### epoll
