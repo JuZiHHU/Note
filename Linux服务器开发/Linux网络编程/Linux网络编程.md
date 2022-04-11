@@ -40,6 +40,10 @@
         - [select](#select)
         - [poll](#poll)
         - [epoll](#epoll)
+  - [UDP通信的实现](#udp通信的实现)
+  - [广播](#广播)
+  - [组播（多播）](#组播多播)
+  - [本地套接字](#本地套接字)
 
 ## 4.1 网络结构模式
 
@@ -111,7 +115,7 @@ IP地址=网络号+主机号
 | :---: | :-----------: | :-----------------------: | :----------------: | :-------------------------: |
 |   A   |  126(2^7-2)   |  1.0.0.1-126.255.255.254  |      16777214      |   10.0.0.0-10.255.255.255   |
 |   B   |  16384(2^14)  | 128.0.0.1-191.255.255.254 |       65534        |  172.16.0.0-172.31.255.255  |
-|   C   | 2097152(2^21) | 92.0.0.1-223.255.255.254  |        254         | 192.168.0.0-192.168.255.255 |
+|   C   | 2097152(2^21) | 192.0.0.1-223.255.255.254  |        254         | 192.168.0.0-192.168.255.255 |
 
 **A类IP地址:** A 类 IP 地址就由 1 字节的网络地址和 3 字节主机地址组成，**网络地址的最高位必须是“0”**
 A 类 IP 地址中网络的标识长度为 8 位，主机标识的长度为 24 位
@@ -1763,3 +1767,752 @@ int main() {
 ```
 
 ##### epoll
+
+```c++
+#include <sys/epoll.h>
+// 创建一个新的epoll实例。在内核中创建了一个数据，这个数据中有两个比较重要的数据，一个是需要检
+测的文件描述符的信息（红黑树），还有一个是就绪列表，存放检测到数据发送改变的文件描述符信息（双向链表）
+int epoll_create(int size);
+- 参数：
+    size : 目前没有意义了。随便写一个数，必须大于0
+- 返回值：
+    -1 : 失败
+    > 0 : 文件描述符，操作epoll实例的
+
+typedef union epoll_data {
+    void *ptr;
+    int fd;
+    uint32_t u32;
+    uint64_t u64;
+} epoll_data_t;
+
+struct epoll_event {
+    uint32_t events; /* Epoll events */
+    epoll_data_t data; /* User data variable */
+};
+常见的Epoll检测事件：
+    - EPOLLIN
+    - EPOLLOUT
+    - EPOLLERR
+// 对epoll实例进行管理：添加文件描述符信息，删除信息，修改信息
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+    - 参数：
+        - epfd : epoll实例对应的文件描述符
+        - op : 要进行什么操作
+            EPOLL_CTL_ADD: 添加
+            EPOLL_CTL_MOD: 修改
+            EPOLL_CTL_DEL: 删除
+        - fd : 要检测的文件描述符
+        - event : 检测文件描述符什么事情
+// 检测函数
+int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
+    - 参数：
+        - epfd : epoll实例对应的文件描述符
+        - events : 传出参数，保存了发送了变化的文件描述符的信息
+        - maxevents : 第二个参数结构体数组的大小
+        - timeout : 阻塞时间
+            - 0 : 不阻塞
+            - -1 : 阻塞，直到检测到fd数据发生变化，解除阻塞
+            - > 0 : 阻塞的时长（毫秒）
+        - 返回值：
+            - 成功，返回发送变化的文件描述符的个数 > 0
+            - 失败 -1
+```
+**Epoll 的工作模式**
+
+- LT 模式 （水平触发）
+    假设委托内核检测读事件 -> 检测fd的读缓冲区   
+    读缓冲区有数据 - > epoll检测到了会给用户通知  
+    a.用户不读数据，数据一直在缓冲区，epoll 会一直通知
+    b.用户只读了一部分数据，epoll会通知
+    c.缓冲区的数据读完了，不通知
+> LT（level - triggered）是缺省的工作方式，并且同时支持 block 和 no-block socket。在这
+种做法中，内核告诉你一个文件描述符是否就绪了，然后你可以对这个就绪的 fd 进行 IO 操
+作。如果你不作任何操作，内核还是会继续通知你的
+
+- ET 模式（边沿触发）
+    假设委托内核检测读事件 -> 检测fd的读缓冲区
+    读缓冲区有数据 - > epoll检测到了会给用户通知
+    a.用户不读数据，数据一致在缓冲区中，epoll下次检测的时候就不通知了
+    b.用户只读了一部分数据，epoll不通知
+    c.缓冲区的数据读完了，不通知
+
+> ET（edge - triggered）是高速工作方式，只支持 no-block socket。在这种模式下，当描述
+符从未就绪变为就绪时，内核通过epoll告诉你。然后它会假设你知道文件描述符已经就绪，
+并且不会再为那个文件描述符发送更多的就绪通知，直到你做了某些操作导致那个文件描述
+符不再为就绪状态了。但是请注意，如果一直不对这个 fd 作 IO 操作（从而导致它再次变成
+未就绪），内核不会发送更多的通知（only once）。
+ET 模式在很大程度上减少了 epoll 事件被重复触发的次数，因此效率要比 LT 模式高。epoll
+工作在 ET 模式的时候，必须使用非阻塞套接口，以避免由于一个文件句柄的阻塞读/阻塞写
+操作把处理多个文件描述符的任务饿死。
+
+```c++
+struct epoll_event {
+    uint32_t events; /* Epoll events */
+    epoll_data_t data; /* User data variable */
+};
+常见的Epoll检测事件：
+    - EPOLLIN
+    - EPOLLOUT
+    - EPOLLERR
+    - EPOLLET
+ ```
+ ![epoll多路复用图解](images/epoll多路复用图解.png)
+
+ **client.c**
+ ```c++
+ #include <stdio.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+
+int main() {
+
+    // 创建socket
+    int fd = socket(PF_INET, SOCK_STREAM, 0);
+    if(fd == -1) {
+        perror("socket");
+        return -1;
+    }
+
+    struct sockaddr_in seraddr;
+    inet_pton(AF_INET, "127.0.0.1", &seraddr.sin_addr.s_addr);
+    seraddr.sin_family = AF_INET;
+    seraddr.sin_port = htons(9998);
+
+    // 连接服务器
+    int ret = connect(fd, (struct sockaddr *)&seraddr, sizeof(seraddr));
+
+    if(ret == -1){
+        perror("connect");
+        return -1;
+    }
+
+    int num = 0;
+	char sendBuf[1024] = {0};
+        // sprintf(sendBuf, "send data %d", num++);
+    fgets(sendBuf, sizeof(sendBuf), stdin);
+
+    write(fd, sendBuf, strlen(sendBuf));
+	
+    while(1) {
+        // 接收
+        
+        memset(sendBuf,'\0',sizeof(sendBuf));
+        int len = read(fd, sendBuf, sizeof(sendBuf));
+        if(len == -1) {
+            perror("read");
+            return -1;
+        }else if(len > 0) {
+            printf("read buf = %s\n", sendBuf);
+        } else {
+            printf("服务器已经断开连接...\n");
+            break;
+        }
+    }
+
+    close(fd);
+
+    return 0;
+}
+```
+
+**epoll_lt.c**
+```c++
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/epoll.h>
+
+int main() {
+
+    // 创建socket
+    int lfd = socket(PF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in saddr;
+    saddr.sin_port = htons(9998);
+    saddr.sin_family = AF_INET;
+    saddr.sin_addr.s_addr = INADDR_ANY;
+
+    // 绑定
+    bind(lfd, (struct sockaddr *)&saddr, sizeof(saddr));
+
+    // 监听
+    listen(lfd, 8);
+
+    // 调用epoll_create()创建一个epoll实例
+    int epfd = epoll_create(100);
+
+    // 将监听的文件描述符相关的检测信息添加到epoll实例中
+    struct epoll_event epev;
+    epev.events = EPOLLIN;
+    epev.data.fd = lfd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &epev);
+
+    struct epoll_event epevs[1024];
+
+    while(1) {
+
+        int ret = epoll_wait(epfd, epevs, 1024, -1);
+        if(ret == -1) {
+            perror("epoll_wait");
+            exit(-1);
+        }
+
+        printf("ret = %d\n", ret);
+
+        for(int i = 0; i < ret; i++) {
+
+            int curfd = epevs[i].data.fd;
+
+            if(curfd == lfd) {
+                // 监听的文件描述符有数据达到，有客户端连接
+                struct sockaddr_in cliaddr;
+                int len = sizeof(cliaddr);
+                int cfd = accept(lfd, (struct sockaddr *)&cliaddr, &len);
+
+                epev.events = EPOLLIN;
+                epev.data.fd = cfd;
+                epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &epev);
+            } else {
+                if(epevs[i].events & EPOLLOUT) {
+                    continue;
+                }   
+                // 有数据到达，需要通信
+                // 长度是3
+                // a b c
+                char buf[3] = {0};
+                int len = read(curfd, buf, sizeof(buf)-1);
+                if(len == -1) {
+                    perror("read");
+                    exit(-1);
+                } else if(len == 0) {
+                    printf("client closed...\n");
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, curfd, NULL);
+                    close(curfd);
+                } else if(len > 0) {
+                    buf[len]='\0';
+                    printf("read buf = %s\n", buf);
+                    //write(curfd, buf, strlen(buf) + 1);
+                    write(curfd, buf, 2);
+                }
+
+            }
+
+        }
+    }
+
+    close(lfd);
+    close(epfd);
+    return 0;
+}
+ ```
+
+ **epoll_et.c**
+
+ ```c++
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <errno.h>
+
+int main() {
+
+    // 创建socket
+    int lfd = socket(PF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in saddr;
+    saddr.sin_port = htons(9999);
+    saddr.sin_family = AF_INET;
+    saddr.sin_addr.s_addr = INADDR_ANY;
+
+    // 绑定
+    bind(lfd, (struct sockaddr *)&saddr, sizeof(saddr));
+
+    // 监听
+    listen(lfd, 8);
+
+    // 调用epoll_create()创建一个epoll实例
+    int epfd = epoll_create(100);
+
+    // 将监听的文件描述符相关的检测信息添加到epoll实例中
+    struct epoll_event epev;
+    epev.events = EPOLLIN;
+    epev.data.fd = lfd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &epev);
+
+    struct epoll_event epevs[1024];
+
+    while(1) {
+
+        int ret = epoll_wait(epfd, epevs, 1024, -1);
+        if(ret == -1) {
+            perror("epoll_wait");
+            exit(-1);
+        }
+
+        printf("ret = %d\n", ret);
+
+        for(int i = 0; i < ret; i++) {
+
+            int curfd = epevs[i].data.fd;
+
+            if(curfd == lfd) {
+                // 监听的文件描述符有数据达到，有客户端连接
+                struct sockaddr_in cliaddr;
+                int len = sizeof(cliaddr);
+                int cfd = accept(lfd, (struct sockaddr *)&cliaddr, &len);
+
+                // 设置cfd属性非阻塞
+                int flag = fcntl(cfd, F_GETFL);
+                flag |= O_NONBLOCK;
+                fcntl(cfd, F_SETFL, flag);
+
+                epev.events = EPOLLIN | EPOLLET;    // 设置边沿触发
+                epev.data.fd = cfd;
+                epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &epev);
+            } else {
+                if(epevs[i].events & EPOLLOUT) {
+                    continue;
+                }  
+
+                // 循环读取出所有数据
+                char buf[5];
+                int len = 0;
+                while( (len = read(curfd, buf, sizeof(buf))) > 0) {
+                    // 打印数据
+                    // printf("recv data : %s\n", buf);
+                    write(STDOUT_FILENO, buf, len);
+                    write(curfd, buf, len);
+                }
+                if(len == 0) {
+                    printf("client closed....");
+                }else if(len == -1) {
+                    // 考虑文件读完情况 
+                    if(errno == EAGAIN) {
+                        printf("data over.....");
+                    }else {
+                        perror("read");
+                        exit(-1);
+                    }
+                    
+                }
+
+            }
+
+        }
+    }
+
+    close(lfd);
+    close(epfd);
+    return 0;
+}
+```
+ ## UDP通信的实现
+ ![/UDP通信过程](images/UDP通信过程.png)
+
+```C++
+#include <sys/types.h>
+#include <sys/socket.h>
+ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+const struct sockaddr *dest_addr, socklen_t addrlen);
+    - 参数：
+        - sockfd : 通信的fd
+        - buf : 要发送的数据
+        - len : 发送数据的长度
+        - flags : 0
+        - dest_addr : 通信的另外一端的地址信息
+        - addrlen : 地址的内存大小
+ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
+struct sockaddr *src_addr, socklen_t *addrlen);
+    - 参数：
+        - sockfd : 通信的fd
+        - buf : 接收数据的数组
+        - len : 数组的大小
+        - flags : 0
+        - src_addr : 用来保存另外一端的地址信息，不需要可以指定为NULL
+        - addrlen : 地址的内存大小
+ ```
+
+ **udp_server.c**
+
+ ```c++
+ #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <arpa/inet.h>
+
+int main() {
+
+    // 1.创建一个通信的socket
+    int fd = socket(PF_INET, SOCK_DGRAM, 0);
+    
+    if(fd == -1) {
+        perror("socket");
+        exit(-1);
+    }   
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(9999);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    // 2.绑定
+    int ret = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if(ret == -1) {
+        perror("bind");
+        exit(-1);
+    }
+
+    // 3.通信
+    while(1) {
+        char recvbuf[128];
+        char ipbuf[16];
+
+        struct sockaddr_in cliaddr;
+        int len = sizeof(cliaddr);
+
+        // 接收数据
+        int num = recvfrom(fd, recvbuf, sizeof(recvbuf), 0, (struct sockaddr *)&cliaddr, &len);
+
+        printf("client IP : %s, Port : %d\n", 
+            inet_ntop(AF_INET, &cliaddr.sin_addr.s_addr, ipbuf, sizeof(ipbuf)),
+            ntohs(cliaddr.sin_port));
+
+        printf("client say : %s\n", recvbuf);
+
+        // 发送数据
+        sendto(fd, recvbuf, strlen(recvbuf) + 1, 0, (struct sockaddr *)&cliaddr, sizeof(cliaddr));
+
+    }
+
+    close(fd);
+    return 0;
+}
+```
+**udp_client.c**
+
+```c++
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <arpa/inet.h>
+
+int main() {
+
+    // 1.创建一个通信的socket
+    int fd = socket(PF_INET, SOCK_DGRAM, 0);
+    
+    if(fd == -1) {
+        perror("socket");
+        exit(-1);
+    }   
+
+    // 服务器的地址信息
+    struct sockaddr_in saddr;
+    saddr.sin_family = AF_INET;
+    saddr.sin_port = htons(9999);
+    inet_pton(AF_INET, "127.0.0.1", &saddr.sin_addr.s_addr);
+
+    int num = 0;
+    // 3.通信
+    while(1) {
+
+        // 发送数据
+        char sendBuf[128];
+        sprintf(sendBuf, "hello , i am client %d \n", num++);
+        sendto(fd, sendBuf, strlen(sendBuf) + 1, 0, (struct sockaddr *)&saddr, sizeof(saddr));
+
+        // 接收数据
+        int num = recvfrom(fd, sendBuf, sizeof(sendBuf), 0, NULL, NULL);
+        printf("server say : %s\n", sendBuf);
+
+        sleep(1);
+    }
+
+    close(fd);
+    return 0;
+}
+```
+
+
+## 广播
+
+> 向子网中多台计算机发送消息，并且子网中所有的计算机都可以接收到发送方发送的消息，每个广
+播消息都包含一个特殊的IP地址，这个IP中子网内主机标志部分的二进制全部为1。
+a.只能在局域网中使用。
+b.客户端需要绑定服务器广播使用的端口，才可以接收到广播消息。
+
+![](images/广播.png)
+
+```c++
+// 设置广播属性的函数
+int setsockopt(int sockfd, int level, int optname,const void *optval, socklen_t
+optlen);
+    - sockfd : 文件描述符
+    - level : SOL_SOCKET
+    - optname : SO_BROADCAST
+    - optval : int类型的值，为1表示允许广播
+    - optlen : optval的大小
+
+```
+
+
+**code 见lesson37 bro_server.c**
+
+
+## 组播（多播）
+
+> 单播地址标识单个 IP 接口，广播地址标识某个子网的所有 IP 接口，多播地址标识一组 IP 接口。单播和广播是寻址方案的两个极端（要么单个要么全部），多播则意在两者之间提供一种折中方案。
+> 
+> 多播数据报只应该由对它感兴趣的接口接收，也就是说由运行相应多播会话应用系统的主机上的接口接收。另外，广播一般局限于局域网内使用，而多播则既可以用于局域网，也可以跨广域网使用。
+> 
+> a.组播既可以用于局域网，也可以用于广域网
+> b.客户端需要加入多播组，才能接收到多播的数据
+
+![](images/组播.png)
+![](images/组播地址.png)
+
+```c++
+int setsockopt(int sockfd, int level, int optname,const void *optval,
+socklen_t optlen);
+// 服务器设置多播的信息，外出接口
+    - level : IPPROTO_IP
+    - optname : IP_MULTICAST_IF
+    - optval : struct in_addr
+    // 客户端加入到多播组：
+    - level : IPPROTO_IP
+    - optname : IP_ADD_MEMBERSHIP
+    - optval : struct ip_mreq
+struct ip_mreq
+{
+    /* IP multicast address of group. */
+    struct in_addr imr_multiaddr; // 组播的IP地址
+    /* Local IP address of interface. */
+    struct in_addr imr_interface; // 本地的IP地址
+};
+typedef uint32_t in_addr_t;
+
+struct in_addr
+{
+    in_addr_t s_addr;
+};
+ ```
+ **code 见lesson37 multi_server.c**
+
+ ## 本地套接字
+
+ > 本地套接字的作用：本地的进程间通信
+有关系的进程间的通信
+没有关系的进程间的通信
+本地套接字实现流程和网络套接字类似，一般呢采用TCP的通信流程。
+
+![](images/sockaddr.png)
+
+ ```c++
+// 本地套接字通信的流程 - tcp
+// 服务器端
+1. 创建监听的套接字
+    int lfd = socket(AF_UNIX/AF_LOCAL, SOCK_STREAM, 0);
+
+2. 监听的套接字绑定本地的套接字文件 -> server端
+    struct sockaddr_un addr;
+    // 绑定成功之后，指定的sun_path中的套接字文件会自动生成。
+    bind(lfd, addr, len);
+
+3. 监听
+    listen(lfd, 100);
+
+4. 等待并接受连接请求
+    struct sockaddr_un cliaddr;
+    int cfd = accept(lfd, &cliaddr, len);
+
+5. 通信
+    接收数据：read/recv
+    发送数据：write/send
+
+6. 关闭连接
+    close();
+    // 客户端的流程
+    1. 创建通信的套接字
+    int fd = socket(AF_UNIX/AF_LOCAL, SOCK_STREAM, 0);
+    2. 监听的套接字绑定本地的IP 端口
+    struct sockaddr_un addr;
+    // 绑定成功之后，指定的sun_path中的套接字文件会自动生成。
+    bind(lfd, addr, len);
+
+3. 连接服务器
+    struct sockaddr_un serveraddr;
+    connect(fd, &serveraddr, sizeof(serveraddr));
+
+4. 通信
+    接收数据：read/recv
+    发送数据：write/send
+
+5. 关闭连接
+close();
+
+// 头文件: sys/un.h
+#define UNIX_PATH_MAX 108
+struct sockaddr_un {
+sa_family_t sun_family; // 地址族协议 af_local
+char sun_path[UNIX_PATH_MAX]; // 套接字文件的路径, 这是一个伪文件, 大小永远=0
+};
+```    
+ 
+**ipc_server.c**
+
+```c++
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <arpa/inet.h>
+#include <sys/un.h>
+
+int main() {
+
+    unlink("server.sock");
+
+    // 1.创建监听的套接字
+    int lfd = socket(AF_LOCAL, SOCK_STREAM, 0);
+    if(lfd == -1) {
+        perror("socket");
+        exit(-1);
+    }
+
+    // 2.绑定本地套接字文件
+    // 绑定成功之后，指定的sun_path中的套接字文件会自动生成。
+    struct sockaddr_un addr;
+    addr.sun_family = AF_LOCAL;
+    strcpy(addr.sun_path, "server.sock");
+    int ret = bind(lfd, (struct sockaddr *)&addr, sizeof(addr));
+    if(ret == -1) {
+        perror("bind");
+        exit(-1);
+    }
+
+    // 3.监听
+    ret = listen(lfd, 100);
+    if(ret == -1) {
+        perror("listen");
+        exit(-1);
+    }
+
+    // 4.等待客户端连接
+    struct sockaddr_un cliaddr;
+    int len = sizeof(cliaddr);
+    int cfd = accept(lfd, (struct sockaddr *)&cliaddr, &len);
+    if(cfd == -1) {
+        perror("accept");
+        exit(-1);
+    }
+
+    printf("client socket filename: %s\n", cliaddr.sun_path);
+
+    // 5.通信
+    while(1) {
+
+        char buf[128];
+        int len = recv(cfd, buf, sizeof(buf), 0);
+
+        if(len == -1) {
+            perror("recv");
+            exit(-1);
+        } else if(len == 0) {
+            printf("client closed....\n");
+            break;
+        } else if(len > 0) {
+            printf("client say : %s\n", buf);
+            send(cfd, buf, len, 0);
+        }
+
+    }
+
+    close(cfd);
+    close(lfd);
+
+    return 0;
+}
+ ```
+
+ **ipc_client.c**
+
+ ```c++
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <arpa/inet.h>
+#include <sys/un.h>
+
+int main() {
+
+    unlink("client.sock");
+
+    // 1.创建套接字
+    int cfd = socket(AF_LOCAL, SOCK_STREAM, 0);
+    if(cfd == -1) {
+        perror("socket");
+        exit(-1);
+    }
+
+    // 2.绑定本地套接字文件
+    struct sockaddr_un addr;
+    addr.sun_family = AF_LOCAL;
+    strcpy(addr.sun_path, "client.sock");
+    int ret = bind(cfd, (struct sockaddr *)&addr, sizeof(addr));
+    if(ret == -1) {
+        perror("bind");
+        exit(-1);
+    }
+
+    // 3.连接服务器
+    struct sockaddr_un seraddr;
+    seraddr.sun_family = AF_LOCAL;
+    strcpy(seraddr.sun_path, "server.sock");
+  
+    ret = connect(cfd, (struct sockaddr *)&seraddr, sizeof(seraddr));
+    if(ret == -1) {
+        perror("connect");
+        exit(-1);
+    }
+
+    // 4.通信
+    int num = 0;
+    while(1) {
+
+        // 发送数据
+        char buf[128];
+        sprintf(buf, "hello, i am client %d\n", num++);
+        send(cfd, buf, strlen(buf) + 1, 0);
+        printf("client say : %s\n", buf);
+
+        // 接收数据
+        int len = recv(cfd, buf, sizeof(buf), 0);
+
+        if(len == -1) {
+            perror("recv");
+            exit(-1);
+        } else if(len == 0) {
+            printf("server closed....\n");
+            break;
+        } else if(len > 0) {
+            printf("server say : %s\n", buf);
+        }
+
+        sleep(1);
+
+    }
+
+    close(cfd);
+    return 0;
+}
+ ```
